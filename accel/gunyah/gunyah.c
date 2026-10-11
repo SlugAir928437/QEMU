@@ -1,0 +1,77 @@
+#include "qemu/osdep.h"
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 1
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+#include "system/address-spaces.h"
+#include "system/memory.h"
+#include "hw/core/boards.h"
+#include "hw/core/cpu.h"
+#include "linux-headers/linux/gunyah.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
+#include "qemu/event_notifier.h"
+#include "qemu/guest-random.h"
+#include "qemu/main-loop.h"
+#include "qemu/typedefs.h"
+#include "qemu/units.h"
+#include "system/cpus.h"
+#include "exec/cpu-common.h"
+#include "system/gunyah.h"
+#include "system/gunyah_int.h"
+#include "system/runstate.h"
+#include "gunyah-ioctl.c"
+#include "gunyah-signal.c"
+#include "gunyah-mem.c"
+#include "gunyah-vm-start.c"
+#include "gunyah-mmio.c"
+#include "gunyah-page-fault.c"
+#include "gunyah-vcpu.c"
+
+void gunyah_embedded_cleanup(void) {
+  GUNYAHState *s;
+  CPUState *cpu;
+  bool lock_acquired = false;
+  if (!gunyah_allowed || !current_machine || !current_machine->accelerator) {
+    return;
+  }
+  s = GUNYAH_STATE(current_accel());
+  qatomic_set(&gunyah_vm_stopped, true);
+  if (!bql_locked()) {
+    bql_lock();
+    lock_acquired = true;
+  }
+  CPU_FOREACH(cpu) {
+    if (cpu->created) {
+      cpu_remove_sync(cpu);
+    }
+  }
+  if (lock_acquired) {
+    bql_unlock();
+  }
+  if (s->vmfd >= 0) {
+    close(s->vmfd);
+    s->vmfd = -1;
+  }
+  if (s->fd >= 0) {
+    close(s->fd);
+    s->fd = -1;
+  }
+  qatomic_set(&s->vm_started, 0);
+  gunyah_signal_reset();
+}
