@@ -41,3 +41,9 @@
 # CONFIG_FSL_IMX7=n
 # CONFIG_FSL_IMX6UL=n
 # CONFIG_ALLWINNER_H3=n
+
+# SPICE: build the QXL PCI VGA device for ARM/AArch64 too.  Upstream only
+# implies QXL from the i386/mips machine configs, but qxl-vga is a plain PCI
+# device and the ARM "virt" machine exposes both PCIe and an I/O window
+# (VIRT_PCIE_PIO), so the SPICE display channel can be used here as well.
+CONFIG_QXL=y
