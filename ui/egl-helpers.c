@@ -225,6 +225,8 @@ void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
 
 EGLContext qemu_egl_rn_ctx;
 
+#if defined(CONFIG_GBM) || defined(__ANDROID__)
+
 /*
  * Export a GL texture as a dma-buf.  This does not touch GBM: it only needs
  * EGL_GL_TEXTURE_2D + EGL_MESA_image_dma_buf_export, so it is also compiled
@@ -263,6 +265,8 @@ bool egl_dmabuf_export_texture(uint32_t tex_id, int *fd, EGLint *offset,
     }
     return true;
 }
+
+#endif /* CONFIG_GBM || __ANDROID__ */
 
 #ifdef CONFIG_GBM
 
@@ -327,6 +331,14 @@ err:
 
     return -1;
 }
+
+#endif /* CONFIG_GBM */
+
+/*
+ * dma-buf texture helpers.  These only use EGL (no GBM), so they are also
+ * used by the Android SPICE GL scanout path in ui/spice-display.c.
+ */
+#if defined(CONFIG_GBM) || defined(__ANDROID__)
 
 void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
 {
@@ -467,7 +479,7 @@ void egl_dmabuf_create_fence(QemuDmaBuf *dmabuf)
     }
 }
 
-#endif /* CONFIG_GBM */
+#endif /* CONFIG_GBM || __ANDROID__ */
 
 /* ---------------------------------------------------------------------- */
 
