@@ -58,6 +58,13 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 
+/*
+ * Multi-touch state (one slot per finger).  SDL is the only backend besides
+ * GTK that can deliver real touch events, so keep the per-slot state here and
+ * feed it to console_handle_touch_event() just like ui/gtk.c does.
+ */
+static struct touch_slot touch_slots[INPUT_EVENT_SLOTS_MAX];
+
 #define SDL2_REFRESH_INTERVAL_BUSY 10
 #define SDL2_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
                              / SDL2_REFRESH_INTERVAL_BUSY + 1)
@@ -548,6 +555,117 @@ static void handle_textinput(SDL_Event *ev)
     }
 }
 
+/*
+ * Feed one SDL finger event to the QEMU input layer.  The guest device is
+ * whatever implements INPUT_EVENT_MASK_MTT (e.g. virtio-multitouch-pci);
+ * without such a device qemu_input_event_send() simply drops the events.
+ */
+static void sdl_send_touch_event(struct sdl2_console *scon,
+                                 SDL_TouchFingerEvent *tev,
+                                 InputMultiTouchType type)
+{
+    int scr_w = 0, scr_h = 0;
+    int surf_w, surf_h;
+    int dst_x = 0, dst_y = 0, dst_w, dst_h;
+    int x, y, slot;
+
+    if (!scon || !scon->real_window || !qemu_console_is_graphic(scon->dcl.con)) {
+        return;
+    }
+
+    SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
+    if (scon->surface) {
+        surf_w = surface_width(scon->surface);
+        surf_h = surface_height(scon->surface);
+    } else {
+        surf_w = 0;
+        surf_h = 0;
+    }
+#ifdef CONFIG_OPENGL
+    if (scon->scanout_mode) {
+        surf_w = scon->guest_fb.width;
+        surf_h = scon->guest_fb.height;
+    }
+#endif
+    if (scr_w <= 0 || scr_h <= 0 || surf_w <= 0 || surf_h <= 0) {
+        return;
+    }
+
+    dst_w = scr_w;
+    dst_h = scr_h;
+#ifdef __LIMBO__
+    /*
+     * SDL_FINGER coordinates are normalized to the window (0..1).  Undo the
+     * same letterboxing that sdl2-2d.c / sdl2-gl.c apply for
+     * limbo_sdl_scale_mode, otherwise touches drift when the guest aspect
+     * ratio does not match the panel.
+     */
+    switch (limbo_sdl_scale_mode < 0 ? 1 : limbo_sdl_scale_mode) {
+    case 0: /* stretch to fill */
+        break;
+    case 2: /* 1:1, centered and clipped */
+        dst_w = MIN(surf_w, scr_w);
+        dst_h = MIN(surf_h, scr_h);
+        dst_x = (scr_w - dst_w) / 2;
+        dst_y = (scr_h - dst_h) / 2;
+        break;
+    default: { /* keep aspect ratio, centered */
+        double scale = MIN((double)scr_w / surf_w, (double)scr_h / surf_h);
+
+        dst_w = (int)(surf_w * scale + 0.5);
+        dst_h = (int)(surf_h * scale + 0.5);
+        dst_x = (scr_w - dst_w) / 2;
+        dst_y = (scr_h - dst_h) / 2;
+        break;
+    }
+    }
+#endif
+
+    x = (int64_t)((int)(tev->x * scr_w) - dst_x) * surf_w / dst_w;
+    y = (int64_t)((int)(tev->y * scr_h) - dst_y) * surf_h / dst_h;
+    x = MAX(0, MIN(x, surf_w - 1));
+    y = MAX(0, MIN(y, surf_h - 1));
+
+    /* The Android SDL backend uses the pointer id as the finger id. */
+    slot = (int)tev->fingerId;
+    if (slot < 0) {
+        slot = 0;
+    } else if (slot >= INPUT_EVENT_SLOTS_MAX) {
+        slot = INPUT_EVENT_SLOTS_MAX - 1;
+    }
+
+    console_handle_touch_event(scon->dcl.con, touch_slots, slot,
+                               surf_w, surf_h, x, y, type, NULL);
+}
+
+static void handle_fingerevent(SDL_Event *ev)
+{
+    /* SDL 2.0.8 touch events carry no windowID; Android uses one window. */
+    struct sdl2_console *scon;
+    InputMultiTouchType type;
+
+    if (sdl2_num_outputs <= 0) {
+        return;
+    }
+    scon = &sdl2_console[0];
+
+    switch (ev->type) {
+    case SDL_FINGERDOWN:
+        type = INPUT_MULTI_TOUCH_TYPE_BEGIN;
+        break;
+    case SDL_FINGERMOTION:
+        type = INPUT_MULTI_TOUCH_TYPE_UPDATE;
+        break;
+    case SDL_FINGERUP:
+        type = INPUT_MULTI_TOUCH_TYPE_END;
+        break;
+    default:
+        return;
+    }
+
+    sdl_send_touch_event(scon, &ev->tfinger, type);
+}
+
 static void handle_mousemotion(SDL_Event *ev)
 {
     int max_x, max_y;
@@ -557,6 +675,19 @@ static void handle_mousemotion(SDL_Event *ev)
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
     }
+
+#ifdef __LIMBO__
+    /*
+     * Touch is already delivered as SDL_FINGER* (see handle_fingerevent()).
+     * SDL's Android backend additionally synthesizes mouse events from the
+     * same touch; forwarding those too would give guests that own both a
+     * multitouch and a pointer device duplicate input.
+     */
+    if (ev->motion.which == SDL_TOUCH_MOUSEID &&
+        qemu_input_is_multitouch(scon->dcl.con)) {
+        return;
+    }
+#endif
 
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
     if (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
@@ -596,6 +727,13 @@ static void handle_mousebutton(SDL_Event *ev)
     }
 
     bev = &ev->button;
+#ifdef __LIMBO__
+    /* See the matching filter in handle_mousemotion(). */
+    if (bev->which == SDL_TOUCH_MOUSEID &&
+        qemu_input_is_multitouch(scon->dcl.con)) {
+        return;
+    }
+#endif
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
     x = (int64_t)bev->x * surface_width(scon->surface) / scr_w;
     y = (int64_t)bev->y * surface_height(scon->surface) / scr_h;
@@ -761,6 +899,12 @@ void sdl2_poll_events(struct sdl2_console *scon)
         case SDL_MOUSEWHEEL:
             idle = 0;
             handle_mousewheel(ev);
+            break;
+        case SDL_FINGERDOWN:
+        case SDL_FINGERMOTION:
+        case SDL_FINGERUP:
+            idle = 0;
+            handle_fingerevent(ev);
             break;
         case SDL_WINDOWEVENT:
             handle_windowevent(ev);
@@ -993,6 +1137,9 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     sdl2_num_outputs = i;
     if (sdl2_num_outputs == 0) {
         return;
+    }
+    for (i = 0; i < INPUT_EVENT_SLOTS_MAX; i++) {
+        touch_slots[i].tracking_id = -1;
     }
     sdl2_console = g_new0(struct sdl2_console, sdl2_num_outputs);
     for (i = 0; i < sdl2_num_outputs; i++) {
