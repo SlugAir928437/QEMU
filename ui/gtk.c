@@ -2512,6 +2512,21 @@ static void early_gtk_display_init(DisplayOptions *opts)
     assert(opts->type == DISPLAY_TYPE_GTK);
     if (opts->has_gl && opts->gl != DISPLAY_GL_MODE_OFF) {
 #if defined(CONFIG_OPENGL)
+#ifdef GDK_WINDOWING_ANDROID
+        /*
+         * Android has no X11/EGL window system: the GTK4 Android backend
+         * implements GdkGLContext on top of the app's ANativeWindow, so
+         * gl=on must use a GtkGLArea (like Wayland/Win32) instead of the
+         * X11 gtk-egl path.  Without this branch gtk_use_gl_area stays
+         * false and display_opengl is never set, which makes
+         * virtio-gpu-gl-pci fail to realize with "The display backend
+         * does not have OpenGL support enabled".
+         */
+        if (GDK_IS_ANDROID_DISPLAY(gdk_display_get_default())) {
+            gtk_use_gl_area = true;
+            gtk_gl_area_init();
+        } else
+#endif
 #if defined(GDK_WINDOWING_WAYLAND)
         if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) {
             gtk_use_gl_area = true;

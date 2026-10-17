@@ -42,15 +42,19 @@ void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
 
 extern EGLContext qemu_egl_rn_ctx;
 
+/* EGL_GL_TEXTURE_2D -> dma-buf export.  Unlike the other dma-buf helpers it
+ * does not need GBM; Android uses it to hand the rendered frame to the SPICE
+ * server (ui/spice-display.c). */
+bool egl_dmabuf_export_texture(uint32_t tex_id, int *fd, EGLint *offset,
+                               EGLint *stride, EGLint *fourcc, int *num_planes,
+                               EGLuint64KHR *modifier);
+
 #ifdef CONFIG_GBM
 
 extern int qemu_egl_rn_fd;
 extern struct gbm_device *qemu_egl_rn_gbm_dev;
 
 int egl_rendernode_init(const char *rendernode, DisplayGLMode mode);
-bool egl_dmabuf_export_texture(uint32_t tex_id, int *fd, EGLint *offset,
-                               EGLint *stride, EGLint *fourcc, int *num_planes,
-                               EGLuint64KHR *modifier);
 
 void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf);
 void egl_dmabuf_release_texture(QemuDmaBuf *dmabuf);

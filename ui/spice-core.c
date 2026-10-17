@@ -849,6 +849,8 @@ static void qemu_spice_init(void)
 
 #ifdef HAVE_SPICE_GL
     if (qemu_opt_get_bool(opts, "gl", 0)) {
+        bool enable_gl = true;
+
         if ((port != 0) || (tls_port != 0)) {
 #if SPICE_SERVER_VERSION >= 0x000f03 /* release 0.15.3 */
             const char *video_codec = NULL;
@@ -862,17 +864,47 @@ static void qemu_spice_init(void)
             }
             if (spice_server_set_video_codecs(spice_server,
                                               enc_codec ?: "gstreamer:h264")) {
-                error_report("invalid video codec");
-                exit(1);
+                /*
+                 * The build may not have gstreamer (the Android spice-server
+                 * is built with -Dgstreamer=no).  The built-in MJPEG encoder
+                 * can stream the GL scanout to remote clients as well, so
+                 * fall back to it instead of refusing to start.
+                 */
+                warn_report("spice: gstreamer codec is unavailable, "
+                            "using the built-in MJPEG encoder");
+                if (spice_server_set_video_codecs(spice_server,
+                                                  "spice:mjpeg")) {
+                    error_report("invalid video codec");
+                    exit(1);
+                }
             }
 #else
-            error_report("SPICE GL support is local-only for now and "
-                         "incompatible with -spice port/tls-port");
-            exit(1);
+            warn_report("spice: GL with a TCP port needs spice-server >= "
+                        "0.15.3, using the 2D display path");
+            enable_gl = false;
 #endif
         }
-        egl_init(qemu_opt_get(opts, "rendernode"), DISPLAY_GL_MODE_ON, &error_fatal);
-        spice_opengl = 1;
+        if (enable_gl) {
+            egl_init(qemu_opt_get(opts, "rendernode"),
+                     DISPLAY_GL_MODE_ON, &error_fatal);
+#ifdef __ANDROID__
+            /*
+             * Android has no GBM: the GL scanout reaches spice-server by
+             * exporting the rendered texture as a dma-buf.  If the system
+             * EGL driver cannot export, keep the regular 2D QXL path rather
+             * than ending up with a blank display.
+             */
+            if (!epoxy_has_egl_extension(qemu_egl_display,
+                                         "EGL_MESA_image_dma_buf_export")) {
+                warn_report("spice: EGL dma-buf export is not supported, "
+                            "disabling GL scanout");
+                enable_gl = false;
+            }
+#endif
+        }
+        if (enable_gl) {
+            spice_opengl = 1;
+        }
     }
 #endif
 }

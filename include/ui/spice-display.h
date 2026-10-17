@@ -27,7 +27,15 @@
 #include "ui/qemu-pixman.h"
 #include "ui/console.h"
 
-#if defined(CONFIG_OPENGL) && defined(CONFIG_GBM)
+/*
+ * SPICE GL scanout only needs EGL plus a way to export the rendered texture
+ * as a dma-buf.  Upstream gates it on CONFIG_GBM because its renderers get
+ * the texture through a GBM device; Android has no GBM but the system EGL
+ * (reached through EGL_DEFAULT_DISPLAY, see the __ANDROID__ branch of
+ * egl_init()) provides the same EGL_GL_TEXTURE_2D -> dma-buf export via
+ * EGL_MESA_image_dma_buf_export, so enable the GL path there too.
+ */
+#if defined(CONFIG_OPENGL) && (defined(CONFIG_GBM) || defined(__ANDROID__))
 #  define HAVE_SPICE_GL 1
 #  include "ui/egl-helpers.h"
 #  include "ui/egl-context.h"

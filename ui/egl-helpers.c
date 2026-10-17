@@ -225,6 +225,45 @@ void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
 
 EGLContext qemu_egl_rn_ctx;
 
+/*
+ * Export a GL texture as a dma-buf.  This does not touch GBM: it only needs
+ * EGL_GL_TEXTURE_2D + EGL_MESA_image_dma_buf_export, so it is also compiled
+ * on Android where the SPICE GL scanout path (ui/spice-display.c) uses it.
+ */
+bool egl_dmabuf_export_texture(uint32_t tex_id, int *fd, EGLint *offset,
+                               EGLint *stride, EGLint *fourcc, int *num_planes,
+                               EGLuint64KHR *modifier)
+{
+    EGLImageKHR image;
+    EGLuint64KHR modifiers[DMABUF_MAX_PLANES];
+    int i;
+
+    image = eglCreateImageKHR(qemu_egl_display, eglGetCurrentContext(),
+                              EGL_GL_TEXTURE_2D_KHR,
+                              (EGLClientBuffer)(unsigned long)tex_id,
+                              NULL);
+    if (!image) {
+        return false;
+    }
+
+    eglExportDMABUFImageQueryMESA(qemu_egl_display, image, fourcc,
+                                  num_planes, modifiers);
+    eglExportDMABUFImageMESA(qemu_egl_display, image, fd, stride, offset);
+    eglDestroyImageKHR(qemu_egl_display, image);
+
+    /* Only first modifier matters. */
+    if (modifier) {
+        *modifier = modifiers[0];
+    }
+
+    for (i = 0; i < *num_planes; i++) {
+        if (fd[i] < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 #ifdef CONFIG_GBM
 
 int qemu_egl_rn_fd;
@@ -287,40 +326,6 @@ err:
     }
 
     return -1;
-}
-
-bool egl_dmabuf_export_texture(uint32_t tex_id, int *fd, EGLint *offset,
-                               EGLint *stride, EGLint *fourcc, int *num_planes,
-                               EGLuint64KHR *modifier)
-{
-    EGLImageKHR image;
-    EGLuint64KHR modifiers[DMABUF_MAX_PLANES];
-    int i;
-
-    image = eglCreateImageKHR(qemu_egl_display, eglGetCurrentContext(),
-                              EGL_GL_TEXTURE_2D_KHR,
-                              (EGLClientBuffer)(unsigned long)tex_id,
-                              NULL);
-    if (!image) {
-        return false;
-    }
-
-    eglExportDMABUFImageQueryMESA(qemu_egl_display, image, fourcc,
-                                  num_planes, modifiers);
-    eglExportDMABUFImageMESA(qemu_egl_display, image, fd, stride, offset);
-    eglDestroyImageKHR(qemu_egl_display, image);
-
-    /* Only first modifier matters. */
-    if (modifier) {
-        *modifier = modifiers[0];
-    }
-
-    for (i = 0; i < *num_planes; i++) {
-        if (fd[i] < 0) {
-            return false;
-        }
-    }
-    return true;
 }
 
 void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
