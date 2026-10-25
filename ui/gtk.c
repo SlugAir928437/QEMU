@@ -1031,6 +1031,11 @@ static void gd_click_pressed(GtkGestureClick *gesture,
     GdkDevice *device;
     GdkInputSource source;
 
+    /* Key events are routed to the focused widget.  Clicking/tapping the
+     * console must move the focus back from the menubar (or any other
+     * widget that took it) to the console. */
+    gtk_widget_grab_focus(vc->gfx.drawing_area);
+
     if (n_press > 1) {
         /* ignore double/triple clicks */
         return;
@@ -1661,6 +1666,11 @@ static void gd_grab_keyboard(VirtualConsole *vc, const char *reason)
     win32_kbd_set_grab(true);
     gd_grab_update(vc, true, vc->s->ptr_owner == vc);
     vc->s->kbd_owner = vc;
+    /* GTK4 has no keyboard grab: keys only reach the console while the
+     * console widget holds the focus. */
+    if (vc->focus) {
+        gtk_widget_grab_focus(vc->focus);
+    }
     gd_update_caption(vc->s);
     trace_gd_grab(vc->label, "kbd", reason);
 }
@@ -2267,6 +2277,11 @@ static void gd_vc_gfx_init(GtkDisplayState *s, VirtualConsole *vc,
         vc->gfx.dcl.ops = &dcl_ops;
     }
 
+    /* GtkDrawingArea sets focusable to FALSE in its init; 'can-focus' alone
+     * is not enough to make it own the keyboard focus, so gtk_widget_grab_focus()
+     * would refuse it.  Both flags are needed for key events to reach the
+     * console. */
+    gtk_widget_set_focusable(vc->gfx.drawing_area, TRUE);
     gtk_widget_set_can_focus(vc->gfx.drawing_area, TRUE);
     /* Clear the pointer automatically if the widget is destroyed while the
      * VM keeps running (Android tears the window down independently). */
@@ -2510,6 +2525,18 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     gd_connect_window_hotkeys(s->window, s, NULL);
 
     gtk_widget_set_visible(s->window, true);
+
+    /* GtkWindow's initial tab-navigation focuses the first focusable
+     * widget, which is the menubar entry.  Keyboard events are then
+     * delivered there instead of to the console, so give the console the
+     * focus explicitly. */
+    if (s->nb_vcs > 0) {
+        VirtualConsole *vc = gd_vc_find_current(s);
+
+        if (vc->focus) {
+            gtk_widget_grab_focus(vc->focus);
+        }
+    }
 
     for (idx = 0;; idx++) {
         QemuConsole *con = qemu_console_lookup_by_index(idx);
