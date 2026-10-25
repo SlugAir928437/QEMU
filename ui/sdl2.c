@@ -218,9 +218,23 @@ void sdl2_window_resize(struct sdl2_console *scon)
         return;
     }
 
+#if defined(__LIMBO__) && defined(__ANDROID__)
+    /*
+     * Limbo/Android：SDL 窗口的大小由 Java 侧 SurfaceView 决定
+     * （surfaceChanged -> onNativeResize -> Android_SetScreenResolution）。
+     * SDL 的 Android 后端没有 SetWindowSize 实现，但 SDL_SetWindowSize()
+     * 会先把 window->w/h 改成这里传入的客户机分辨率，真实 EGL/ANativeWindow
+     * 尺寸却不变。于是 SDL_GetWindowSize() 报的是客户机分辨率，2D 渲染路径
+     * 用的却是 renderer output（真实表面）尺寸，渲染矩形与输入映射矩形就
+     * 差出一个随位置线性增长的偏移。这里直接跳过，保持
+     * window->w/h == 真实表面尺寸。
+     */
+    return;
+#else
     SDL_SetWindowSize(scon->real_window,
                       surface_width(scon->surface),
                       surface_height(scon->surface));
+#endif
 }
 
 static void sdl2_redraw(struct sdl2_console *scon)
@@ -372,8 +386,16 @@ static void sdl_mouse_mode_change(Notifier *notify, void *data)
     }
 }
 
+/*
+ * surf_w/surf_h 必须与调用方把窗口坐标映射成 x/y 时使用的客户机尺寸一致：
+ * 绝对指针事件最终按 x ∈ [0, surf_w] 归一化到 0..0x7FFF，如果这里用另一
+ * 套尺寸（例如 scon->surface 的尺寸），归一化比例就和看得见的画面不一致，
+ * 表现为光标偏移、屏幕边缘附近触控无效。GL scanout 下 scon->surface 也可
+ * 能为 NULL，直接读 surface_width() 会解引用空指针。
+ */
 static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
-                                 int x, int y, int state)
+                                 int x, int y, int state,
+                                 int surf_w, int surf_h)
 {
     static uint32_t bmap[INPUT_BUTTON__MAX] = {
         [INPUT_BUTTON_LEFT]       = SDL_BUTTON(SDL_BUTTON_LEFT),
@@ -391,9 +413,9 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
 
     if (qemu_input_is_absolute(scon->dcl.con)) {
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_X,
-                             x, 0, surface_width(scon->surface));
+                             x, 0, surf_w);
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y,
-                             y, 0, surface_height(scon->surface));
+                             y, 0, surf_h);
     } else {
         if (guest_cursor) {
             x -= guest_x;
@@ -782,7 +804,8 @@ static void handle_mousemotion(SDL_Event *ev)
     dx = (int64_t)ev->motion.xrel * surf_w / dst_w;
     dy = (int64_t)ev->motion.yrel * surf_h / dst_h;
     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
-        sdl_send_mouse_event(scon, dx, dy, x, y, ev->motion.state);
+        sdl_send_mouse_event(scon, dx, dy, x, y, ev->motion.state,
+                             surf_w, surf_h);
     }
 }
 
@@ -847,7 +870,7 @@ static void handle_mousebutton(SDL_Event *ev)
         } else {
             buttonstate &= ~SDL_BUTTON(bev->button);
         }
-        sdl_send_mouse_event(scon, 0, 0, x, y, buttonstate);
+        sdl_send_mouse_event(scon, 0, 0, x, y, buttonstate, surf_w, surf_h);
     }
 }
 
