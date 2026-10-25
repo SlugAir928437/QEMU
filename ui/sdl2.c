@@ -556,6 +556,57 @@ static void handle_textinput(SDL_Event *ev)
 }
 
 /*
+ * Compute the on-window rectangle where the guest surface is actually drawn,
+ * accounting for limbo_sdl_scale_mode (stretch / keep-aspect / 1:1).  All
+ * three scale modes (sdl2-2d.c ::limbo_sdl_scale_dst_rect, sdl2-gl.c
+ * ::limbo_sdl_gl_apply_viewport, sdl2-gl.c ::limbo_sdl_gl_scanout_rect) agree
+ * on this rectangle; input paths must use the same math so window
+ * coordinates map to the visible guest area instead of the whole window.
+ *
+ * Returns dst_x/dst_y/dst_w/dst_h (the guest rect within the window); the
+ * scale_mode < 0 default is "keep aspect".
+ */
+#ifdef __LIMBO__
+static void limbo_compute_letterbox(int scr_w, int scr_h,
+                                    int surf_w, int surf_h,
+                                    int *out_x, int *out_y,
+                                    int *out_w, int *out_h)
+{
+    int mode = limbo_sdl_scale_mode < 0 ? 1 : limbo_sdl_scale_mode;
+    int dst_x = 0, dst_y = 0, dst_w = scr_w, dst_h = scr_h;
+
+    if (scr_w <= 0 || scr_h <= 0 || surf_w <= 0 || surf_h <= 0) {
+        goto out;
+    }
+
+    switch (mode) {
+    case 0: /* stretch to fill — no letterbox */
+        break;
+    case 2: /* 1:1, centered and clipped */
+        dst_w = MIN(surf_w, scr_w);
+        dst_h = MIN(surf_h, scr_h);
+        dst_x = (scr_w - dst_w) / 2;
+        dst_y = (scr_h - dst_h) / 2;
+        break;
+    default: { /* keep aspect ratio, centered */
+        double scale = MIN((double)scr_w / surf_w, (double)scr_h / surf_h);
+
+        dst_w = (int)(surf_w * scale + 0.5);
+        dst_h = (int)(surf_h * scale + 0.5);
+        dst_x = (scr_w - dst_w) / 2;
+        dst_y = (scr_h - dst_h) / 2;
+        break;
+    }
+    }
+out:
+    if (out_x) *out_x = dst_x;
+    if (out_y) *out_y = dst_y;
+    if (out_w) *out_w = dst_w;
+    if (out_h) *out_h = dst_h;
+}
+#endif /* __LIMBO__ */
+
+/*
  * Feed one SDL finger event to the QEMU input layer.  The guest device is
  * whatever implements INPUT_EVENT_MASK_MTT (e.g. virtio-multitouch-pci);
  * without such a device qemu_input_event_send() simply drops the events.
@@ -591,34 +642,11 @@ static void sdl_send_touch_event(struct sdl2_console *scon,
         return;
     }
 
-    dst_w = scr_w;
-    dst_h = scr_h;
 #ifdef __LIMBO__
-    /*
-     * SDL_FINGER coordinates are normalized to the window (0..1).  Undo the
-     * same letterboxing that sdl2-2d.c / sdl2-gl.c apply for
-     * limbo_sdl_scale_mode, otherwise touches drift when the guest aspect
-     * ratio does not match the panel.
-     */
-    switch (limbo_sdl_scale_mode < 0 ? 1 : limbo_sdl_scale_mode) {
-    case 0: /* stretch to fill */
-        break;
-    case 2: /* 1:1, centered and clipped */
-        dst_w = MIN(surf_w, scr_w);
-        dst_h = MIN(surf_h, scr_h);
-        dst_x = (scr_w - dst_w) / 2;
-        dst_y = (scr_h - dst_h) / 2;
-        break;
-    default: { /* keep aspect ratio, centered */
-        double scale = MIN((double)scr_w / surf_w, (double)scr_h / surf_h);
-
-        dst_w = (int)(surf_w * scale + 0.5);
-        dst_h = (int)(surf_h * scale + 0.5);
-        dst_x = (scr_w - dst_w) / 2;
-        dst_y = (scr_h - dst_h) / 2;
-        break;
-    }
-    }
+    limbo_compute_letterbox(scr_w, scr_h, surf_w, surf_h,
+                            &dst_x, &dst_y, &dst_w, &dst_h);
+#else
+    dst_x = 0; dst_y = 0; dst_w = scr_w; dst_h = scr_h;
 #endif
 
     x = (int64_t)((int)(tev->x * scr_w) - dst_x) * surf_w / dst_w;
@@ -668,9 +696,9 @@ static void handle_fingerevent(SDL_Event *ev)
 
 static void handle_mousemotion(SDL_Event *ev)
 {
-    int max_x, max_y;
     struct sdl2_console *scon = get_scon_from_window(ev->motion.windowID);
     int scr_w, scr_h, surf_w, surf_h, x, y, dx, dy;
+    int dst_x = 0, dst_y = 0, dst_w, dst_h;
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
@@ -690,26 +718,69 @@ static void handle_mousemotion(SDL_Event *ev)
 #endif
 
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
+    if (scon->surface) {
+        surf_w = surface_width(scon->surface);
+        surf_h = surface_height(scon->surface);
+    } else {
+        surf_w = 0;
+        surf_h = 0;
+    }
+#ifdef CONFIG_OPENGL
+    if (scon->scanout_mode) {
+        surf_w = scon->guest_fb.width;
+        surf_h = scon->guest_fb.height;
+    }
+#endif
+    if (scr_w <= 0 || scr_h <= 0 || surf_w <= 0 || surf_h <= 0) {
+        return;
+    }
+
+#ifdef __LIMBO__
+    /*
+     * 先算 letterbox 矩形，grab 边缘判定和坐标映射都要用它。
+     * 客户机画面在窗口里实际画在 dst_x..dst_x+dst_w / dst_y..dst_y+dst_h；
+     * 客户机之外的区域是黑边（或拉伸时覆盖整个窗口）。
+     */
+    limbo_compute_letterbox(scr_w, scr_h, surf_w, surf_h,
+                            &dst_x, &dst_y, &dst_w, &dst_h);
+#else
+    dst_x = 0; dst_y = 0; dst_w = scr_w; dst_h = scr_h;
+#endif
+
     if (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
-        max_x = scr_w - 1;
-        max_y = scr_h - 1;
+        /*
+         * grab 的触发/释放要用 letterbox 矩形的边缘，不是整个窗口边缘：
+         * 等比 / 1:1 缩放模式下窗口四周有黑边，用户手指落在黑边上不应该
+         * 影响 grab 状态，只有进入/离开实际显示区域才该切换 grab。
+         */
+        int left   = dst_x;
+        int top    = dst_y;
+        int right  = dst_x + dst_w - 1;
+        int bottom = dst_y + dst_h - 1;
+
         if (gui_grab && !gui_fullscreen
-            && (ev->motion.x == 0 || ev->motion.y == 0 ||
-                ev->motion.x == max_x || ev->motion.y == max_y)) {
+            && (ev->motion.x == left || ev->motion.y == top ||
+                ev->motion.x == right || ev->motion.y == bottom)) {
             sdl_grab_end(scon);
         }
         if (!gui_grab &&
-            (ev->motion.x > 0 && ev->motion.x < max_x &&
-             ev->motion.y > 0 && ev->motion.y < max_y)) {
+            (ev->motion.x > left && ev->motion.x < right &&
+             ev->motion.y > top && ev->motion.y < bottom)) {
             sdl_grab_start(scon);
         }
     }
-    surf_w = surface_width(scon->surface);
-    surf_h = surface_height(scon->surface);
-    x = (int64_t)ev->motion.x * surf_w / scr_w;
-    y = (int64_t)ev->motion.y * surf_h / scr_h;
-    dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
-    dy = (int64_t)ev->motion.yrel * surf_h / scr_h;
+
+    /*
+     * Absolute coords are in window pixels; subtract the letterbox offset and
+     * then scale into the guest surface.  Relative deltas only need scaling
+     * (the letterbox is a pure translation, it does not affect deltas).
+     */
+    x = (int64_t)(ev->motion.x - dst_x) * surf_w / dst_w;
+    y = (int64_t)(ev->motion.y - dst_y) * surf_h / dst_h;
+    x = MAX(0, MIN(x, surf_w - 1));
+    y = MAX(0, MIN(y, surf_h - 1));
+    dx = (int64_t)ev->motion.xrel * surf_w / dst_w;
+    dy = (int64_t)ev->motion.yrel * surf_h / dst_h;
     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
         sdl_send_mouse_event(scon, dx, dy, x, y, ev->motion.state);
     }
@@ -720,7 +791,8 @@ static void handle_mousebutton(SDL_Event *ev)
     int buttonstate = SDL_GetMouseState(NULL, NULL);
     SDL_MouseButtonEvent *bev;
     struct sdl2_console *scon = get_scon_from_window(ev->button.windowID);
-    int scr_w, scr_h, x, y;
+    int scr_w, scr_h, surf_w, surf_h, x, y;
+    int dst_x = 0, dst_y = 0, dst_w, dst_h;
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
@@ -735,8 +807,34 @@ static void handle_mousebutton(SDL_Event *ev)
     }
 #endif
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
-    x = (int64_t)bev->x * surface_width(scon->surface) / scr_w;
-    y = (int64_t)bev->y * surface_height(scon->surface) / scr_h;
+    if (scon->surface) {
+        surf_w = surface_width(scon->surface);
+        surf_h = surface_height(scon->surface);
+    } else {
+        surf_w = 0;
+        surf_h = 0;
+    }
+#ifdef CONFIG_OPENGL
+    if (scon->scanout_mode) {
+        surf_w = scon->guest_fb.width;
+        surf_h = scon->guest_fb.height;
+    }
+#endif
+    if (scr_w <= 0 || scr_h <= 0 || surf_w <= 0 || surf_h <= 0) {
+        return;
+    }
+
+#ifdef __LIMBO__
+    limbo_compute_letterbox(scr_w, scr_h, surf_w, surf_h,
+                            &dst_x, &dst_y, &dst_w, &dst_h);
+#else
+    dst_x = 0; dst_y = 0; dst_w = scr_w; dst_h = scr_h;
+#endif
+
+    x = (int64_t)(bev->x - dst_x) * surf_w / dst_w;
+    y = (int64_t)(bev->y - dst_y) * surf_h / dst_h;
+    x = MAX(0, MIN(x, surf_w - 1));
+    y = MAX(0, MIN(y, surf_h - 1));
 
     if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
