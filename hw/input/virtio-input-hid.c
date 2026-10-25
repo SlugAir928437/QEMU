@@ -49,6 +49,21 @@ static const unsigned short axismap_tch[INPUT_AXIS__MAX] = {
     [INPUT_AXIS_Y]                   = ABS_MT_POSITION_Y,
 };
 
+/*
+ * 触摸屏只声明 BTN_TOUCH，不声明 BTN_LEFT/RIGHT/MIDDLE。
+ *
+ * Windows 的 virtio-win vioinput 驱动按 EV 位图猜测设备类型：
+ *   - 鼠标类要求 EV_KEY 里有 BTN_MOUSE..BTN_JOYSTICK 之间的按键，并且
+ *     EV_ABS 里有 ABS_X/ABS_Y；满足时会把 ABS_X/ABS_Y 从位图里取走；
+ *   - 平板类随后要求 EV_ABS 里“恰好”还有 ABS_X/ABS_Y 两个轴，否则直接
+ *     返回 STATUS_INSUFFICIENT_RESOURCES，在设备管理器里就是“代码 10
+ *     （系统资源不够，无法完成 API）”。
+ * 因此 multitouch 设备必须同时：声明 ABS_X/ABS_Y，且不声明鼠标按键。
+ */
+static const unsigned short keymap_touch[] = {
+    BTN_TOUCH,
+};
+
 /* ----------------------------------------------------------------- */
 
 static void virtio_input_extend_config(VirtIOInput *vinput,
@@ -468,6 +483,19 @@ static struct virtio_input_config virtio_multitouch_config[] = {
             .version = const_le16(0x0001),
         },
     },{
+        /* Windows vioinput 的平板类探测要求这两个轴存在（见 keymap_touch） */
+        .select    = VIRTIO_INPUT_CFG_ABS_INFO,
+        .subsel    = ABS_X,
+        .size      = sizeof(virtio_input_absinfo),
+        .u.abs.min = const_le32(INPUT_EVENT_ABS_MIN),
+        .u.abs.max = const_le32(INPUT_EVENT_ABS_MAX),
+    },{
+        .select    = VIRTIO_INPUT_CFG_ABS_INFO,
+        .subsel    = ABS_Y,
+        .size      = sizeof(virtio_input_absinfo),
+        .u.abs.min = const_le32(INPUT_EVENT_ABS_MIN),
+        .u.abs.max = const_le32(INPUT_EVENT_ABS_MAX),
+    },{
         .select    = VIRTIO_INPUT_CFG_ABS_INFO,
         .subsel    = ABS_MT_SLOT,
         .size      = sizeof(virtio_input_absinfo),
@@ -503,6 +531,8 @@ static void virtio_multitouch_init(Object *obj)
         INPUT_PROP_DIRECT,
     };
     unsigned short abs_bits[] = {
+        ABS_X,
+        ABS_Y,
         ABS_MT_SLOT,
         ABS_MT_TRACKING_ID,
         ABS_MT_POSITION_X,
@@ -511,8 +541,8 @@ static void virtio_multitouch_init(Object *obj)
 
     vhid->handler = &virtio_multitouch_handler;
     virtio_input_init_config(vinput, virtio_multitouch_config);
-    virtio_input_extend_config(vinput, keymap_button,
-                               ARRAY_SIZE(keymap_button),
+    virtio_input_extend_config(vinput, keymap_touch,
+                               ARRAY_SIZE(keymap_touch),
                                VIRTIO_INPUT_CFG_EV_BITS, EV_KEY);
     virtio_input_extend_config(vinput, abs_props,
                                ARRAY_SIZE(abs_props),
