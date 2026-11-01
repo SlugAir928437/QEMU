@@ -658,6 +658,26 @@ void console_handle_touch_event(QemuConsole *con,
     }
 
     if (needs_sync) {
+        /*
+         * BTN_TOUCH 必须跟着手指状态走：还有手指按着就保持 1，最后一根手指
+         * 抬起后置 0。上面的 END 分支只发 ABS_MT_TRACKING_ID=-1，从不发
+         * BTN_TOUCH=0；libinput 靠 BTN_TOUCH 的按下->抬起边沿来界定一次触摸
+         * 序列，缺了抬起就认为手指一直按着，KWin（Plasma Wayland）在第一次
+         * 触摸之后不再产生 touch down，触摸屏看起来完全不可用
+         * （evtest 里能看到 TRACKING_ID=-1 却没有 BTN_TOUCH 0 就是这个症状）。
+         */
+        bool touching = false;
+
+        for (i = 0; i < INPUT_EVENT_SLOTS_MAX; ++i) {
+            if (touch_slots[i].tracking_id != -1) {
+                touching = true;
+                break;
+            }
+        }
+
+        if (!touching) {
+            qemu_input_queue_btn(con, INPUT_BUTTON_TOUCH, false);
+        }
         qemu_input_event_sync();
     }
 }
