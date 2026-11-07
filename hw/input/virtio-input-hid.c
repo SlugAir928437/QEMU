@@ -50,7 +50,7 @@ static const unsigned short axismap_tch[INPUT_AXIS__MAX] = {
 };
 
 /*
- * 触摸屏只声明 BTN_TOUCH，不声明 BTN_LEFT/RIGHT/MIDDLE。
+ * 触摸屏声明 BTN_TOUCH + BTN_TOOL_FINGER，不声明 BTN_LEFT/RIGHT/MIDDLE。
  *
  * Windows 的 virtio-win vioinput 驱动按 EV 位图猜测设备类型：
  *   - 鼠标类要求 EV_KEY 里有 BTN_MOUSE..BTN_JOYSTICK 之间的按键，并且
@@ -59,9 +59,20 @@ static const unsigned short axismap_tch[INPUT_AXIS__MAX] = {
  *     返回 STATUS_INSUFFICIENT_RESOURCES，在设备管理器里就是“代码 10
  *     （系统资源不够，无法完成 API）”。
  * 因此 multitouch 设备必须同时：声明 ABS_X/ABS_Y，且不声明鼠标按键。
+ *
+ * Linux 客户机（Debian trixie 等）这边是另一套判定：
+ *   - udev/systemd-logind 与 libinput 把“有 BTN_TOUCH + ABS_X/Y（或
+ *     ABS_MT_POSITION_X/Y）”的设备归类成 ID_INPUT_TOUCHSCREEN；
+ *   - Xorg 的 xf86-input-evdev / xf86-input-libinput 对绝对坐标设备的
+ *     第一道分类是 BTN_TOOL_FINGER：只给 BTN_TOUCH 时它会把设备当成
+ *     “没有按键的绝对指针”，既不算触摸屏也不算数位板，于是不注册输入
+ *     设备，表现就是客户机里“完全认不出这块触摸屏”。
+ * BTN_TOOL_FINGER(0x145) 落在 BTN_MOUSE(0x110)..BTN_JOYSTICK(0x120) 之外，
+ * 不会被 vioinput 的鼠标类探测命中，所以对 Windows 侧判定无影响。
  */
 static const unsigned short keymap_touch[] = {
     BTN_TOUCH,
+    BTN_TOOL_FINGER,
 };
 
 /* ----------------------------------------------------------------- */
@@ -165,6 +176,20 @@ static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
             event.code  = cpu_to_le16(axismap_tch[mtt->axis]);
             event.value = cpu_to_le32(mtt->value);
             virtio_input_send(vinput, &event);
+            /*
+             * 主触点（slot 0）在 MT 轴之外再补一组传统 ABS_X/ABS_Y。
+             * virtio_multitouch_config 里本来就声明了 ABS_X/ABS_Y（Windows
+             * vioinput 要求），但只发 ABS_MT_POSITION_* 时，只认单点绝对
+             * 坐标的老消费端（Xorg 的 xf86-input-evdev 单点路径、直接用
+             * ABS_X/Y 的工具）收不到坐标，表现为“触摸屏不理人”。多触点
+             * 消费端（libinput）走 MT 轴，重复的 ABS_X/Y 不影响它。
+             */
+            if (mtt->slot == 0) {
+                event.type  = cpu_to_le16(EV_ABS);
+                event.code  = cpu_to_le16(axismap_abs[mtt->axis]);
+                event.value = cpu_to_le32(mtt->value);
+                virtio_input_send(vinput, &event);
+            }
         } else {
             event.type  = cpu_to_le16(EV_ABS);
             event.code  = cpu_to_le16(ABS_MT_SLOT);
