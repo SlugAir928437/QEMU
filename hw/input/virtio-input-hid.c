@@ -77,10 +77,11 @@ static const unsigned short keymap_touch[] = {
 
 /* ----------------------------------------------------------------- */
 
-static void virtio_input_extend_config(VirtIOInput *vinput,
-                                       const unsigned short *map,
-                                       size_t mapsize,
-                                       uint8_t select, uint8_t subsel)
+static void virtio_input_extend_config_full(VirtIOInput *vinput,
+                                            const unsigned short *map,
+                                            size_t mapsize,
+                                            uint8_t select, uint8_t subsel,
+                                            bool code_zero_is_valid)
 {
     virtio_input_config ext;
     int i, bit, byte, bmax = 0;
@@ -88,7 +89,13 @@ static void virtio_input_extend_config(VirtIOInput *vinput,
     memset(&ext, 0, sizeof(ext));
     for (i = 0; i < mapsize; i++) {
         bit = map[i];
-        if (!bit) {
+        /*
+         * 稀疏映射（qcode/button 表，按索引取值）里 0 表示“这个槽位没映射”，
+         * 要跳过；但显式事件码列表里 0 是合法的事件号 ABS_X，不能跳过，
+         * 否则客户机 EV_ABS 位图里缺 ABS_X，libinput 会因 ABS_X/ABS_Y 只
+         * 出现一个而拒绝整块触摸设备（evdev_reject_device 的 XOR 判定）。
+         */
+        if (!bit && !code_zero_is_valid) {
             continue;
         }
         byte = bit / 8;
@@ -102,6 +109,16 @@ static void virtio_input_extend_config(VirtIOInput *vinput,
     ext.subsel = subsel;
     ext.size   = bmax;
     virtio_input_add_config(vinput, &ext);
+}
+
+/* 稀疏映射入口：0 槽位按“未映射”处理（保持原有行为）。 */
+static void virtio_input_extend_config(VirtIOInput *vinput,
+                                       const unsigned short *map,
+                                       size_t mapsize,
+                                       uint8_t select, uint8_t subsel)
+{
+    virtio_input_extend_config_full(vinput, map, mapsize,
+                                    select, subsel, false);
 }
 
 static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
@@ -572,9 +589,9 @@ static void virtio_multitouch_init(Object *obj)
     virtio_input_extend_config(vinput, abs_props,
                                ARRAY_SIZE(abs_props),
                                VIRTIO_INPUT_CFG_PROP_BITS, 0);
-    virtio_input_extend_config(vinput, abs_bits,
-                               ARRAY_SIZE(abs_bits),
-                               VIRTIO_INPUT_CFG_EV_BITS, EV_ABS);
+    virtio_input_extend_config_full(vinput, abs_bits,
+                                    ARRAY_SIZE(abs_bits),
+                                    VIRTIO_INPUT_CFG_EV_BITS, EV_ABS, true);
 }
 
 static const TypeInfo virtio_multitouch_info = {
