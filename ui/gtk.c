@@ -104,6 +104,13 @@ static struct touch_slot touch_slots[INPUT_EVENT_SLOTS_MAX];
 
 bool gtk_use_gl_area;
 
+/*
+ * Limbo: 运行期切换画面输出需要拿到 GTK 的显示状态（见
+ * gtk_switch_console() / gd_menu_switch_vc()）。这里保存 gtk_display_init()
+ * 创建的那一份；GTK 后端在同一进程里只初始化一次。
+ */
+static GtkDisplayState *gtk_display_state;
+
 static void gd_grab_pointer(VirtualConsole *vc, const char *reason);
 static void gd_ungrab_pointer(GtkDisplayState *s);
 static void gd_grab_keyboard(VirtualConsole *vc, const char *reason);
@@ -706,6 +713,35 @@ static void gd_resize_event(GtkGLArea *area,
                             gint width, gint height, gpointer opaque)
 {
     VirtualConsole *vc = opaque;
+#ifdef __LIMBO__
+    /*
+     * LIMBO repurposes scale_x / scale_y as aspect-ratio-preserving factors
+     * in gd_update_scale().  After recomputing them from the current widget
+     * size and guest framebuffer, fbw * scale_x × fbh * scale_y gives us the
+     * largest rectangle the guest's image occupies inside the widget while
+     * keeping the guest aspect ratio — exactly what we should advertise as
+     * the guest-visible UI size.  Passing the full widget logical pixel
+     * size would tell the guest "your monitor is N×M" where N×M has the
+     * phone's portrait aspect, while the guest GPU (virtio-gpu / ramfb)
+     * expects a landscape framebuffer, causing GNOME to mis-detect the
+     * monitor orientation and pick a strange scale / layout.
+     */
+    const int gs = gtk_widget_get_scale_factor(GTK_WIDGET(area));
+    int ww_widget = width / gs;
+    int wh_widget = height / gs;
+    int fbw = vc->gfx.ds ? surface_width(vc->gfx.ds) : 0;
+    int fbh = vc->gfx.ds ? surface_height(vc->gfx.ds) : 0;
+
+    if (fbw > 0 && fbh > 0) {
+        gd_update_scale(vc, ww_widget, wh_widget, fbw, fbh);
+        gd_set_ui_size(vc,
+                       (gint)(fbw * vc->gfx.scale_x + 0.5),
+                       (gint)(fbh * vc->gfx.scale_y + 0.5));
+    } else {
+        /* guest framebuffer not ready yet — best effort fallback */
+        gd_set_ui_size(vc, ww_widget, wh_widget);
+    }
+#else
     double pw = width, ph = height;
     double sx = vc->gfx.scale_x, sy = vc->gfx.scale_y;
     const int gs = gtk_widget_get_scale_factor(GTK_WIDGET(area));
@@ -720,6 +756,7 @@ static void gd_resize_event(GtkGLArea *area,
      * by global window scale (gs)
      */
     gd_set_ui_size(vc, pw / gs, ph / gs);
+#endif
 }
 
 #endif
@@ -776,11 +813,21 @@ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget)
         refresh_rate = 0;
     }
 
+#ifdef __LIMBO__
+    /*
+     * VRR：limbo_gtk_refresh_rate（由 Java 侧 set_qemu_var 下发）优先于
+     * GDK monitor 的刷新率覆盖 ui_info，确保 monitor 看到的值和
+     * update_interval 实际跑的频率一致。
+     */
+    if (limbo_gtk_refresh_rate > 0) {
+        refresh_rate = limbo_gtk_refresh_rate * 1000; /* Hz -> mHz */
+    }
+#endif
+
     gd_set_ui_refresh_rate(vc, refresh_rate);
 
     /* T = 1 / f = 1 [s*Hz] / f = 1000*1000 [ms*mHz] / f */
 #ifdef __LIMBO__
-    /* VRR：用户显式选定了目标频率时，输出节奏严格按它走（见上面的定义）。 */
     vc->gfx.dcl.update_interval = limbo_gtk_refresh_interval(refresh_rate);
 #else
     vc->gfx.dcl.update_interval = refresh_rate ?
@@ -899,8 +946,19 @@ static void gd_draw_func(GtkDrawingArea *area, cairo_t *cr,
 
     /* report the guest-visible size back to the guest (if it cares) */
     if (!s->free_scale && !s->full_screen && vc->gfx.scale_x > 0) {
+#ifdef __LIMBO__
+        /*
+         * Same story as gd_resize_event() above — advertise the aspect-
+         * respecting inner rectangle (fbw*scale_x × fbh*scale_y) rather
+         * than the raw widget size, so the guest GPU keeps its natural
+         * landscape/portrait orientation even when the phone screen has
+         * the opposite aspect.
+         */
+        gd_set_ui_size(vc, ww_surface, wh_surface);
+#else
         gd_set_ui_size(vc, ww_widget / vc->gfx.scale_x,
                        wh_widget / vc->gfx.scale_y);
+#endif
     }
 
     cairo_rectangle(cr, 0, 0, ww_widget, wh_widget);
@@ -2464,6 +2522,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     assert(opts->type == DISPLAY_TYPE_GTK);
     s = g_malloc0(sizeof(*s));
     s->opts = opts;
+    gtk_display_state = s;
 
     theme = gtk_icon_theme_get_for_display(gdk_display_get_default());
     dir = get_relocated_path(CONFIG_QEMU_ICONDIR);
@@ -2627,11 +2686,46 @@ static void early_gtk_display_init(DisplayOptions *opts)
 #endif
 }
 
+/*
+ * Limbo: 把画面切到下一块（delta > 0）/ 上一块（delta < 0）显卡的控制台。
+ * GTK 后端给每块显卡各建了一个 notebook 页（页面序号与控制台索引一致），
+ * 所以定位到目标图形控制台后直接切页即可；每个页面的显示监听器一直存在，
+ * 不需要重新注册。
+ */
+static bool gtk_switch_console(int delta)
+{
+    GtkDisplayState *s = gtk_display_state;
+    QemuConsole *cur = NULL;
+    QemuConsole *next;
+    int page, idx;
+
+    if (!s || s->nb_vcs <= 0) {
+        return false;
+    }
+    page = gtk_notebook_get_current_page(GTK_NOTEBOOK(s->notebook));
+    if (page >= 0 && page < s->nb_vcs &&
+        s->vc[page].type == GD_VC_GFX &&
+        qemu_console_is_graphic(s->vc[page].gfx.dcl.con)) {
+        cur = s->vc[page].gfx.dcl.con;
+    }
+    next = qemu_console_lookup_next_graphic(cur, delta);
+    if (!next || next == cur) {
+        return false;
+    }
+    idx = qemu_console_get_index(next);
+    if (idx < 0 || idx >= s->nb_vcs) {
+        return false;
+    }
+    gd_menu_switch_vc(s, idx);
+    return true;
+}
+
 static QemuDisplay qemu_display_gtk = {
     .type       = DISPLAY_TYPE_GTK,
     .early_init = early_gtk_display_init,
     .init       = gtk_display_init,
     .vc         = "vc",
+    .switch_console = gtk_switch_console,
 };
 
 static void register_gtk(void)
