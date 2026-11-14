@@ -921,9 +921,20 @@ static void agl_display_init(DisplayState *ds, DisplayOptions *options)
         if (!candidate) {
             break;
         }
-        if (qemu_console_is_graphic(candidate)) {
+        if (!qemu_console_is_graphic(candidate)) {
+            continue;
+        }
+        /*
+         * 每块显卡都挂上 AGL 的 GL 上下文：ramfb + virtio-gpu-gl 这类多显卡
+         * 配置下，未被显示的控制台也要能接受客户机的 GL 扫描输出（否则
+         * virtio-gpu 会因为 console_has_gl() 为假而拒绝客户机的 virgl
+         * 上下文创建），切换过去才能直接看到画面。
+         */
+        if (!console_has_gl(candidate)) {
+            qemu_console_set_display_gl_ctx(candidate, &agl.dgc);
+        }
+        if (!console) {
             console = candidate;
-            break;
         }
     }
     if (!console) {
@@ -933,7 +944,6 @@ static void agl_display_init(DisplayState *ds, DisplayOptions *options)
     agl.dcl.ops = &agl_dcl_ops;
     agl.dcl.con = console;
     agl.dgc.ops = &agl_gl_ops;
-    qemu_console_set_display_gl_ctx(console, &agl.dgc);
     register_displaychangelistener(&agl.dcl);
     if (pthread_create(&agl.thread, NULL, agl_render_thread, NULL)) {
         error_report("AGL: renderer thread creation failed");
@@ -942,10 +952,44 @@ static void agl_display_init(DisplayState *ds, DisplayOptions *options)
     agl.thread_started = true;
 }
 
+/*
+ * 把唯一的 AGL 窗口从当前控制台切到下一块（delta > 0）/ 上一块（delta < 0）
+ * 显卡。ramfb 只负责固件阶段的画面，客户机装上 virtio-gpu 驱动后输出会转到
+ * 另一个控制台，需要由这里把画面换过去。
+ *
+ * register_displaychangelistener() 会立刻把新控制台当前的画面以及 GL 扫描
+ * 输出重新推给渲染线程（见 ui/console.c 的
+ * displaychangelistener_display_console），因此切换后不必额外重绘。
+ */
+static bool agl_switch_console(int delta)
+{
+    QemuConsole *old = agl.dcl.con;
+    QemuConsole *next;
+
+    if (!agl.thread_started) {
+        return false;
+    }
+    next = qemu_console_lookup_next_graphic(old, delta);
+    if (!next || next == old) {
+        return false;
+    }
+    if (!qemu_console_can_display(next, &agl.dcl)) {
+        /* 目标控制台要求 AGL 提供不了的能力（例如 DMABUF），保持原画面 */
+        return false;
+    }
+
+    unregister_displaychangelistener(&agl.dcl);
+    agl.dcl.con = next;
+    register_displaychangelistener(&agl.dcl);
+    graphic_hw_update(next);
+    return true;
+}
+
 static QemuDisplay agl_display = {
     .type = DISPLAY_TYPE_AGL,
     .early_init = agl_display_early_init,
     .init = agl_display_init,
+    .switch_console = agl_switch_console,
 };
 
 static void agl_register(void)
