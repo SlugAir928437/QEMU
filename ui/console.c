@@ -693,6 +693,26 @@ void qemu_console_set_display_gl_ctx(QemuConsole *con, DisplayGLCtx *gl)
     con->gl = gl;
 }
 
+/*
+ * Limbo: 判断显示监听器能否绘制该控制台。register_displaychangelistener()
+ * 用的兼容性检查失败时会走 error_fatal 直接退出进程，运行期切换画面输出
+ * （特别是切到 virtio-gpu-gl 这类要求 GL/DMABUF 的控制台）前先用这里挡一下，
+ * 不满足时保持当前画面不变。
+ */
+bool qemu_console_can_display(QemuConsole *con, DisplayChangeListener *dcl)
+{
+    Error *err = NULL;
+
+    if (!con) {
+        return false;
+    }
+    if (console_compatible_with(con, dcl, &err)) {
+        return true;
+    }
+    error_free(err);
+    return false;
+}
+
 static void
 dcl_set_graphic_cursor(DisplayChangeListener *dcl, QemuGraphicConsole *con)
 {
@@ -1277,6 +1297,53 @@ QemuConsole *qemu_console_lookup_by_index(unsigned int index)
     return NULL;
 }
 
+/*
+ * Limbo: 在图形控制台列表里前后移动。ramfb + virtio-gpu 这类多显卡配置会
+ * 产生多个图形控制台，显示后端需要能在它们之间切换（见
+ * qemu_display_switch_console）。
+ */
+QemuConsole *qemu_console_lookup_next_graphic(QemuConsole *cur, int delta)
+{
+    QemuConsole *con, *res;
+    GPtrArray *graphics;
+    int i, count, idx = 0;
+    bool found = cur == NULL;
+
+    graphics = g_ptr_array_new();
+    QTAILQ_FOREACH(con, &consoles, next) {
+        if (QEMU_IS_GRAPHIC_CONSOLE(con)) {
+            g_ptr_array_add(graphics, con);
+        }
+    }
+    count = graphics->len;
+    if (count == 0) {
+        g_ptr_array_free(graphics, TRUE);
+        return NULL;
+    }
+    if (cur) {
+        for (i = 0; i < count; i++) {
+            if (g_ptr_array_index(graphics, i) == cur) {
+                idx = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        /* cur 不是图形控制台（例如 GTK 当前停在文本控制台）：从第一块开始 */
+        res = g_ptr_array_index(graphics, delta < 0 ? count - 1 : 0);
+    } else {
+        if (delta > 0) {
+            idx = (idx + 1) % count;
+        } else if (delta < 0) {
+            idx = (idx + count - 1) % count;
+        }
+        res = g_ptr_array_index(graphics, idx);
+    }
+    g_ptr_array_free(graphics, TRUE);
+    return res;
+}
+
 QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head)
 {
     QemuConsole *con;
@@ -1524,6 +1591,9 @@ PixelFormat qemu_default_pixelformat(int bpp)
 
 static QemuDisplay *dpys[DISPLAY_TYPE__MAX];
 
+/* Limbo: 当前实际启用的显示后端，供 qemu_display_switch_console() 使用。 */
+static DisplayType active_display_type = DISPLAY_TYPE_NONE;
+
 void qemu_display_register(QemuDisplay *ui)
 {
     assert(ui->type < DISPLAY_TYPE__MAX);
@@ -1592,7 +1662,43 @@ void qemu_display_init(DisplayState *ds, DisplayOptions *opts)
         return;
     }
     assert(dpys[opts->type] != NULL);
+    active_display_type = opts->type;
     dpys[opts->type]->init(ds, opts);
+}
+
+/*
+ * Limbo: 把画面切到下一块（delta > 0）/ 上一块（delta < 0）显卡的控制台。
+ * 只有实现了 switch_console 的本地显示后端（AGL/SDL/GTK）支持；SPICE、VNC、
+ * egl-headless 等没有本地窗口的后端返回 false。
+ */
+bool qemu_display_switch_console(int delta)
+{
+    QemuDisplay *dpy;
+
+    if (active_display_type >= DISPLAY_TYPE__MAX) {
+        return false;
+    }
+    dpy = dpys[active_display_type];
+    if (!dpy || !dpy->switch_console) {
+        return false;
+    }
+    return dpy->switch_console(delta);
+}
+
+/*
+ * liblimbo.so 的入口，通过 dlsym("limbo_display_switch") 找到（见
+ * jni/limbo/vm-executor-jni.c）。Java 的界面线程直接调用它，而显示监听器
+ * 的重新绑定必须发生在 QEMU 主循环线程，因此统一投递 BH 后再切换。
+ */
+static void limbo_display_switch_bh(void *opaque)
+{
+    qemu_display_switch_console((int)(intptr_t)opaque);
+}
+
+void limbo_display_switch(int delta)
+{
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), limbo_display_switch_bh,
+                            (void *)(intptr_t)delta);
 }
 
 const char *qemu_display_get_vc(DisplayOptions *opts)

@@ -444,6 +444,13 @@ struct QemuDisplay {
     void (*early_init)(DisplayOptions *opts);
     void (*init)(DisplayState *ds, DisplayOptions *opts);
     const char *vc;
+    /*
+     * Limbo: 多块显卡（例如 ramfb + virtio-gpu）时切换显示后端当前呈现的
+     * 控制台。delta > 0 表示下一块显卡，delta < 0 表示上一块；返回 true
+     * 表示确实发生了切换。只有一个图形控制台时需要返回 false。
+     * 只能从 QEMU 主循环线程调用（见 limbo_display_switch()）。
+     */
+    bool (*switch_console)(int delta);
 };
 
 void qemu_display_register(QemuDisplay *ui);
@@ -452,6 +459,25 @@ void qemu_display_early_init(DisplayOptions *opts);
 void qemu_display_init(DisplayState *ds, DisplayOptions *opts);
 const char *qemu_display_get_vc(DisplayOptions *opts);
 void qemu_display_help(void);
+
+/* Limbo: 切换当前显示后端呈现的图形控制台（见 struct QemuDisplay）。 */
+bool qemu_display_switch_console(int delta);
+
+/*
+ * Limbo: liblimbo.so 通过 dlsym("limbo_display_switch") 调用的线程安全入口，
+ * 可从任意线程调用（内部投递到 QEMU 主循环执行实际切换）。
+ */
+void limbo_display_switch(int delta);
+
+/* Limbo: 显示监听器能否绘制该控制台（不满足时 register 会 error_fatal）。 */
+bool qemu_console_can_display(QemuConsole *con, DisplayChangeListener *dcl);
+
+/*
+ * Limbo: 取下一块（delta > 0）/ 上一块（delta < 0）图形控制台。cur 为 NULL
+ * 时从第一块开始；只有一块图形控制台时返回 cur 本身，调用方据此判断没有
+ * 其它可显示的输出。
+ */
+QemuConsole *qemu_console_lookup_next_graphic(QemuConsole *cur, int delta);
 
 /* vnc.c */
 void vnc_display_init(const char *id, Error **errp);
