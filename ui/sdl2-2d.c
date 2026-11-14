@@ -155,6 +155,9 @@ void sdl2_2d_switch(DisplayChangeListener *dcl,
 
     if (!scon->real_window) {
         sdl2_window_create(scon);
+        if (!scon->real_window) {
+            return;
+        }
     } else if (old_surface &&
                ((surface_width(old_surface)  != surface_width(new_surface)) ||
                 (surface_height(old_surface) != surface_height(new_surface)))) {

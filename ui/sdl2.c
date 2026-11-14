@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/sdl2.h"
@@ -41,6 +42,17 @@
 
 static int sdl2_num_outputs;
 static struct sdl2_console *sdl2_console;
+
+#ifdef __ANDROID__
+/*
+ * Limbo: Android 的 SDL 视频后端只允许一个窗口（SDL_androidwindow.c：
+ * "Android only supports one window"）。ramfb + virtio-gpu 这类多显卡配置
+ * 会产生多个图形控制台，但给每块显卡各建一个窗口是不可能的，因此这里只给
+ * sdl2_active_idx 这一块显卡注册显示监听器（唯一窗口），运行期由
+ * sdl2_switch_console() 把同一个窗口重新绑定到另一块显卡的控制台上。
+ */
+static int sdl2_active_idx = -1;
+#endif
 
 static SDL_Surface *guest_sprite_surface;
 static int gui_grab; /* if true, all keyboard/mouse events are grabbed */
@@ -170,6 +182,11 @@ void sdl2_window_create(struct sdl2_console *scon)
                                          surface_width(scon->surface),
                                          surface_height(scon->surface),
                                          flags);
+    if (!scon->real_window) {
+        /* e.g. Android 已经有窗口了：不要继续用 NULL 窗口建渲染器/GL 上下文 */
+        error_report("SDL: window creation failed: %s", SDL_GetError());
+        return;
+    }
     if (scon->opengl) {
         const char *driver = "opengl";
 
@@ -974,6 +991,32 @@ static void handle_windowevent(SDL_Event *ev)
     }
 }
 
+#ifdef __LIMBO__
+/*
+ * 把 limbo_sdl_refresh_rate（Hz）同步到 QemuUIInfo.refresh_rate（mHz），
+ * 让 QEMU monitor / guest 能拿到当前实际刷新率。
+ * 仿照 GTK 后端的 gd_set_ui_refresh_rate()。
+ */
+static void sdl2_set_ui_refresh_rate(struct sdl2_console *scon)
+{
+    QemuUIInfo info;
+    uint32_t mhz;
+
+    if (!dpy_ui_info_supported(scon->dcl.con)) {
+        return;
+    }
+    if (limbo_sdl_refresh_rate <= 0) {
+        mhz = 0;
+    } else {
+        mhz = (uint32_t)limbo_sdl_refresh_rate * 1000; /* Hz -> mHz */
+    }
+
+    info = *dpy_get_ui_info(scon->dcl.con);
+    info.refresh_rate = mhz;
+    dpy_set_ui_info(scon->dcl.con, &info, true);
+}
+#endif
+
 void sdl2_poll_events(struct sdl2_console *scon)
 {
     SDL_Event ev1, *ev = &ev1;
@@ -984,6 +1027,23 @@ void sdl2_poll_events(struct sdl2_console *scon)
         scon->last_vm_running = runstate_is_running();
         sdl_update_caption(scon);
     }
+
+#ifdef __LIMBO__
+    /*
+     * 检测 limbo_sdl_refresh_rate 是否变化：
+     * Java 侧通过 set_qemu_var("limbo_sdl_refresh_rate", hz) 下发后，
+     * 这里在事件循环里第一时间同步 ui_info.refresh_rate 给 QEMU monitor/guest。
+     * 和 sdl2-2d.c / sdl2-gl.c 里检测 scale mode 变化的模式相同。
+     */
+    {
+        static int limbo_last_sdl_refresh_rate = -999;
+
+        if (limbo_last_sdl_refresh_rate != limbo_sdl_refresh_rate) {
+            limbo_last_sdl_refresh_rate = limbo_sdl_refresh_rate;
+            sdl2_set_ui_refresh_rate(scon);
+        }
+    }
+#endif
 
     while (SDL_PollEvent(ev)) {
         switch (ev->type) {
@@ -1259,6 +1319,20 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     if (sdl2_num_outputs == 0) {
         return;
     }
+#ifdef __ANDROID__
+    /* 唯一窗口默认显示第一块图形显卡（控制台 0）。 */
+    for (i = 0; i < sdl2_num_outputs; i++) {
+        QemuConsole *con = qemu_console_lookup_by_index(i);
+
+        if (qemu_console_is_graphic(con)) {
+            sdl2_active_idx = i;
+            break;
+        }
+    }
+    if (sdl2_active_idx < 0) {
+        sdl2_active_idx = 0;
+    }
+#endif
     for (i = 0; i < INPUT_EVENT_SLOTS_MAX; i++) {
         touch_slots[i].tracking_id = -1;
     }
@@ -1284,8 +1358,28 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
         sdl2_console[i].kbd = qkbd_state_init(con);
 #ifdef CONFIG_OPENGL
         if (display_opengl) {
-            qemu_console_set_display_gl_ctx(con, &sdl2_console[i].dgc);
+            if (qemu_console_is_graphic(con) && !console_has_gl(con)) {
+                /*
+                 * 未显示的显卡也要拿到 GL 上下文，否则 virtio-gpu 会把客户机
+                 * 的 virgl/blob 上下文创建当作"没有 GL 显示后端"而拒绝，
+                 * 切换过去时画面是空的。
+                 */
+                qemu_console_set_display_gl_ctx(con, &sdl2_console[i].dgc);
+            }
+#ifdef __ANDROID__
+            if (i == sdl2_active_idx) {
+                /* 只有当前显示的控制台能建窗口（探测 dmabuf 用） */
+                sdl2_gl_console_init(&sdl2_console[i]);
+            }
+#else
             sdl2_gl_console_init(&sdl2_console[i]);
+#endif
+        }
+#endif
+#ifdef __ANDROID__
+        if (i != sdl2_active_idx) {
+            /* 见 sdl2_active_idx 的注释：其余控制台不注册监听器。 */
+            continue;
         }
 #endif
         register_displaychangelistener(&sdl2_console[i].dcl);
@@ -1334,10 +1428,53 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     qemu_main = NULL;
 }
 
+#ifdef __ANDROID__
+/*
+ * 把唯一的 SDL 窗口从当前控制台切到下一块（delta > 0）/ 上一块（delta < 0）
+ * 显卡。ramfb 只负责固件阶段的画面，客户机装上 virtio-gpu 驱动后输出会转到
+ * 另一个控制台，需要由这里把画面换过去。
+ *
+ * 窗口本身不销毁重建（Android 只允许一个窗口，而且重建窗口会让 virtio-gpu
+ * 持有的 GL 上下文失效），只把窗口所属的显示监听器重新绑定到目标控制台。
+ * register_displaychangelistener() 会立刻用目标控制台当前的画面调用
+ * dpy_gfx_switch，窗口里的纹理随之更新。
+ */
+static bool sdl2_switch_console(int delta)
+{
+    struct sdl2_console *scon;
+    QemuConsole *old, *next;
+
+    if (sdl2_num_outputs <= 0 || !sdl2_console || sdl2_active_idx < 0) {
+        return false;
+    }
+    scon = &sdl2_console[sdl2_active_idx];
+    old = scon->dcl.con;
+    next = qemu_console_lookup_next_graphic(old, delta);
+    if (!next || next == old) {
+        return false;
+    }
+    if (!qemu_console_can_display(next, &scon->dcl)) {
+        /* 目标控制台要求 SDL 提供不了的能力（例如 DMABUF），保持原画面 */
+        return false;
+    }
+
+    unregister_displaychangelistener(&scon->dcl);
+    scon->dcl.con = next;
+    /* 键盘状态里记的是旧控制台，切过去时要跟着换，避免按键发错地方。 */
+    qkbd_state_switch_console(scon->kbd, next);
+    register_displaychangelistener(&scon->dcl);
+    graphic_hw_update(next);
+    return true;
+}
+#endif
+
 static QemuDisplay qemu_display_sdl2 = {
     .type       = DISPLAY_TYPE_SDL,
     .early_init = sdl2_display_early_init,
     .init       = sdl2_display_init,
+#ifdef __ANDROID__
+    .switch_console = sdl2_switch_console,
+#endif
 };
 
 static void register_sdl1(void)
